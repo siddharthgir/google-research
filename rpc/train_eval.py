@@ -106,7 +106,8 @@ def train_eval(
     clip_min_stddev=0.1,
     clip_mean=30.0,
     predictor_num_layers=2,
-    use_identity_encoder=False,
+    long_predictor_steps=3,
+    encoder_type = "long",
     identity_encoder_single_stddev=False,
     kl_constraint=1.0,
     eval_dropout=(),
@@ -115,6 +116,9 @@ def train_eval(
     predict_prior_std=True,
     random_seed=0,):
   """A simple train and eval for SAC."""
+
+
+  #Logging + Setup Code
   np.random.seed(random_seed)
   tf.random.set_seed(random_seed)
   if use_recurrent_actor:
@@ -131,13 +135,18 @@ def train_eval(
       eval_dir, flush_millis=summaries_flush_secs * 1000)
 
   global_step = tf.compat.v1.train.get_or_create_global_step()
-  with tf.compat.v2.summary.record_if(
-      lambda: tf.math.equal(global_step % summary_interval, 0)):
+
+
+
+  with tf.compat.v2.summary.record_if(lambda: tf.math.equal(global_step % summary_interval, 0)):
+
 
     _build_env = functools.partial(suite_gym.load, environment_name=env_name,  # pylint: disable=invalid-name
                                    gym_env_wrappers=(), gym_kwargs=gym_kwargs)
-
+    
     tf_env = tf_py_environment.TFPyEnvironment(_build_env())
+
+    #Setup code for logging + metrics
     eval_vec = []  # (name, env, metrics)
     eval_metrics = [
         tf_metrics.AverageReturnMetric(buffer_size=num_eval_episodes),
@@ -147,6 +156,7 @@ def train_eval(
     name = ''
     eval_vec.append((name, eval_tf_env, eval_metrics))
 
+    #Setup code for environment details
     time_step_spec = tf_env.time_step_spec()
     observation_spec = time_step_spec.observation
     action_spec = tf_env.action_spec()
@@ -170,7 +180,7 @@ def train_eval(
       t2 = rpc_utils.squash_to_range(t2, low, high)
       return tf.concat([t1, t2], axis=1)
 
-    if use_identity_encoder:
+    if encoder_type == "identity":
       assert latent_dim == observation_spec.shape[0]
       obs_input = tf.keras.layers.Input(observation_spec.shape)
       zeros = 0.0 * obs_input[:, :1]
@@ -182,7 +192,7 @@ def train_eval(
       output = tfp.layers.IndependentNormal(latent_dim)(pre_mean_stddev)
       encoder_net = tf.keras.Model(inputs=obs_input,
                                    outputs=output)
-    else:
+    elif encoder_type == "short": #Building Encoder network
       encoder_net = tf.keras.Sequential([
           tf.keras.layers.Dense(256, activation='relu'),
           tf.keras.layers.Dense(256, activation='relu'),
@@ -192,6 +202,24 @@ def train_eval(
               kernel_initializer='glorot_uniform'),
           tfp.layers.IndependentNormal(latent_dim),
       ])
+    elif encoder_type == "long":
+      long_latent_dim = latent_dim
+      obs_input = tf.keras.layers.Input(observation_spec.shape)
+      hidden_1 = tf.keras.layers.Dense(256, activation='relu')(obs_input)
+      hidden_2 = tf.keras.layers.Dense(256, activation='relu')(hidden_1)
+      short_layer = tf.keras.layers.Dense(
+              tfp.layers.IndependentNormal.params_size(latent_dim),
+              activation=_activation,
+              kernel_initializer='glorot_uniform')(hidden_2)
+      short_out = tfp.layers.IndependentNormal(latent_dim)(short_layer)
+      long_layer = tf.keras.layers.Dense(
+              tfp.layers.IndependentNormal.params_size(long_latent_dim),
+              activation=_activation,
+              kernel_initializer='glorot_uniform')(hidden_2)
+      long_out = tfp.layers.IndependentNormal(long_latent_dim)(long_layer)
+
+      encoder_net = tf.keras.Model(inputs=obs_input,outputs=[short_out,long_out])
+      
 
     # Build the predictor net
     obs_input = tf.keras.layers.Input(observation_spec.shape)
@@ -210,8 +238,13 @@ def train_eval(
         loc_scale = loc_scale * tf.ones_like(inputs[:, :1])
         return super(ConstantIndependentNormal, self).call(loc_scale)
 
+    #Setup of dynamics network
     if predict_prior:
-      z = encoder_net(obs_input)
+      if encoder_type == "long":
+        short_enc,long_enc = encoder_net(obs_input)
+        z = tf.concat([short_enc,long_enc],axis=1)
+      else:
+        z = encoder_net(obs_input)
       if not predictor_updates_encoder:
         z = tf.stop_gradient(z)
       za = tf.concat([z, action_input], axis=1)
@@ -227,9 +260,7 @@ def train_eval(
         if predict_prior_std:
           combined_loc_scale = tf.concat([
               loc_scale[:, :latent_dim] + za_input[:, :latent_dim],
-              loc_scale[:, latent_dim:]
-          ],
-                                         axis=1)
+              loc_scale[:, latent_dim:]],axis=1)
         else:
           # Note that softplus(log(e - 1)) = 1.
           combined_loc_scale = tf.concat([
@@ -263,8 +294,39 @@ def train_eval(
           ConstantIndependentNormal(latent_dim),
       ])(
           za)
+    
+    
     predictor_net = tf.keras.Model(inputs=(obs_input, action_input),
                                    outputs=output)
+
+    h_predictor_net = None
+    if encoder_type == "long":
+      obs_input = tf.keras.layers.Input(observation_spec.shape)
+      _,h = encoder_net(obs_input)
+
+      if not predictor_updates_encoder:
+        h = tf.stop_gradient(h)
+
+      h_input = tf.keras.layers.Input(h.shape[1])
+
+      loc_scale = tf.keras.Sequential(
+            predictor_num_layers * [tf.keras.layers.Dense(256, activation='relu')] + [  # pylint: disable=line-too-long
+                tf.keras.layers.Dense(
+                    tfp.layers.IndependentNormal.params_size(latent_dim),
+                    activation=_activation,
+                    kernel_initializer='zeros'),])(h_input)
+
+      combined_loc_scale = tf.concat([
+              loc_scale[:, :latent_dim] + h_input[:, :latent_dim],
+              loc_scale[:, latent_dim:]],axis=1)
+
+      dist = tfp.layers.IndependentNormal(latent_dim)(combined_loc_scale)
+      output = tf.keras.Model(inputs=h_input, outputs=dist)(h)
+
+      h_predictor_net = tf.keras.Model(inputs=(obs_input),
+                                   outputs=output)
+
+    #Actor-Critic Network Setup
     if use_recurrent_actor:
       ActorClass = rpc_utils.RecurrentActorNet  # pylint: disable=invalid-name
     else:
@@ -274,7 +336,8 @@ def train_eval(
         output_tensor_spec=action_spec,
         encoder=encoder_net,
         predictor=predictor_net,
-        fc_layers=actor_fc_layers)
+        fc_layers=actor_fc_layers,
+        long_predictor = h_predictor_net)
 
     critic_net = rpc_utils.CriticNet(
         (observation_spec, action_spec),
@@ -287,6 +350,7 @@ def train_eval(
     target_critic_net_1 = None
     target_critic_net_2 = None
 
+    #Creation of actual agent
     tf_agent = rpc_agent.RpAgent(
         time_step_spec,
         action_spec,
@@ -321,6 +385,7 @@ def train_eval(
         max_length=replay_buffer_capacity)
     replay_observer = [replay_buffer.add_batch]
 
+    #Setup of training metrics
     train_metrics = [
         tf_metrics.NumberOfEpisodes(),
         tf_metrics.EnvironmentSteps(),
@@ -332,12 +397,14 @@ def train_eval(
     kl_metric = rpc_utils.AverageKLMetric(
         encoder=encoder_net,
         predictor=predictor_net,
-        batch_size=tf_env.batch_size)
+        batch_size=tf_env.batch_size,
+        encoder_type=encoder_type)
     eval_policy = greedy_policy.GreedyPolicy(tf_agent.policy)
     initial_collect_policy = random_tf_policy.RandomTFPolicy(
         tf_env.time_step_spec(), tf_env.action_spec())
     collect_policy = tf_agent.collect_policy
 
+    #Setup of checkpointing
     checkpoint_items = {
         'ckpt_dir': train_dir,
         'agent': tf_agent,
@@ -359,6 +426,8 @@ def train_eval(
     train_checkpointer.initialize_or_restore()
     rb_checkpointer.initialize_or_restore()
 
+
+    
     initial_collect_driver = dynamic_step_driver.DynamicStepDriver(
         tf_env,
         initial_collect_policy,
@@ -414,11 +483,18 @@ def train_eval(
 
       tf_agent._as_transition = data_converter.AsTransition(  # pylint: disable=protected-access
           tf_agent.data_context, squeeze_time_dim=False)
+    elif encoder_type == "long":
+      num_steps = long_predictor_steps + 1
+      def _filter_invalid_transition(trajectories, unused_arg1):
+        return tf.reduce_all(~trajectories.is_boundary()[:-1])
+      tf_agent._as_transition = data_converter.AsTransition(  # pylint: disable=protected-access
+          tf_agent.data_context, squeeze_time_dim=False)
     else:
       num_steps = 2
 
       def _filter_invalid_transition(trajectories, unused_arg1):
         return ~trajectories.is_boundary()[0]
+    
     dataset = replay_buffer.as_dataset(
         sample_batch_size=batch_size,
         num_steps=num_steps).unbatch().filter(_filter_invalid_transition)
@@ -430,12 +506,23 @@ def train_eval(
     @tf.function
     def train_step():
       experience, _ = next(iterator)
-
+      print("input to predictor net",experience.observation[:,0].shape)
+      print("action input to predictor net",experience.action[:,0].shape)
       prior = predictor_net((experience.observation[:, 0],
                              experience.action[:, 0]), training=False)
-      z_next = encoder_net(experience.observation[:, 1], training=False)
-      # predictor_kl is a vector of size batch_size.
+
+      if encoder_type == "long":
+        z_next,_ = encoder_net(experience.observation[:, 1], training=False)
+      else:
+        z_next = encoder_net(experience.observation[:, 1], training=False)
       predictor_kl = tfp.distributions.kl_divergence(z_next, prior)
+
+      random_sample = 0
+      if encoder_type == "long":
+        random_sample = tf.random.uniform(shape=(), minval=1, maxval=long_predictor_steps+1, dtype=tf.int32)
+        _,h_next = encoder_net(experience.observation[:, random_sample], training=False)
+        h_prior = h_predictor_net(experience.observation[:, 0],training=False)
+        predictor_kl += tfp.distributions.kl_divergence(h_next, h_prior)
 
       with tf.GradientTape() as tape:
         tape.watch(actor_net._log_kl_coefficient)  # pylint: disable=protected-access
@@ -483,7 +570,8 @@ def train_eval(
       new_reward = experience.reward - coef * predictor_kl[:, None]
 
       experience = experience._replace(reward=new_reward)
-      return tf_agent.train(experience)
+      print("Starting train step")
+      return tf_agent.train(experience,encoder_type=encoder_type,chosen_index=random_sample)
 
     if use_tf_functions:
       train_step = common.function(train_step)
@@ -587,4 +675,6 @@ def main(_):
 
 if __name__ == '__main__':
   flags.mark_flag_as_required('root_dir')
+  print(tf.executing_eagerly())
+
   app.run(main)

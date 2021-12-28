@@ -25,12 +25,13 @@ from tf_agents.networks import utils
 from tf_agents.utils import common
 from tf_agents.utils import nest_utils
 from tf_agents.utils import object_identity
+from tf_agents.trajectories.time_step import TimeStep
 
 
 class RpAgent(sac_agent.SacAgent):
   """Implements the RPC agent."""
 
-  def _train(self, experience, weights):
+  def _train(self, experience, weights,encoder_type=None,chosen_index=None):
     """Modifies the default _train step in two ways.
 
       1. Passes actions and next time steps to actor loss.
@@ -44,8 +45,10 @@ class RpAgent(sac_agent.SacAgent):
     Returns:
       A train_op.
     """
+    print("starting user step")
     transition = self._as_transition(experience)
     time_steps, policy_steps, next_time_steps = transition
+    print(encoder_type,chosen_index)
     actions = policy_steps.action
 
     trainable_critic_variables = list(object_identity.ObjectIdentitySet(
@@ -58,6 +61,20 @@ class RpAgent(sac_agent.SacAgent):
         tf.reduce_mean(next_time_steps.reward), 'next_ts.reward is inf or nan.')
     tf.debugging.check_numerics(
         tf.reduce_mean(actions), 'Actions is inf or nan.')
+
+    print("starting critic loss")
+    long_obs = None
+    if encoder_type == "long":
+      print(time_steps)
+      time_steps = TimeStep(time_steps.step_type[:,0],time_steps.reward[:,0],time_steps.discount[:,0],time_steps.observation[:,0])
+      long_obs = next_time_steps.observation[:,chosen_index-1]
+
+      next_time_steps = TimeStep(next_time_steps.step_type[:,0],next_time_steps.reward[:,0],next_time_steps.discount[:,0],next_time_steps.observation[:,0])
+      print("set long_obs shape as",long_obs.shape)
+      
+      print(actions.shape,"pre change")
+      actions = actions[:,0]
+      print(actions.shape)
 
     with tf.GradientTape(watch_accessed_variables=False) as tape:
       assert trainable_critic_variables, ('No trainable critic variables to '
@@ -72,6 +89,7 @@ class RpAgent(sac_agent.SacAgent):
           reward_scale_factor=self._reward_scale_factor,
           weights=weights,
           training=True)
+    print("got critic loss")
 
     tf.debugging.check_numerics(critic_loss, 'Critic loss is inf or nan.')
     critic_grads = tape.gradient(critic_loss, trainable_critic_variables)
@@ -84,7 +102,7 @@ class RpAgent(sac_agent.SacAgent):
                                          'optimize.')
       tape.watch(trainable_actor_variables)
       actor_loss = self._actor_loss_weight*self.actor_loss(
-          time_steps, actions, next_time_steps, weights=weights)
+          time_steps, actions, next_time_steps, weights=weights,encoder_type=encoder_type,long_obs=long_obs)
     tf.debugging.check_numerics(actor_loss, 'Actor loss is inf or nan.')
     actor_grads = tape.gradient(actor_loss, trainable_actor_variables)
     self._apply_gradients(actor_grads, trainable_actor_variables,
@@ -123,7 +141,9 @@ class RpAgent(sac_agent.SacAgent):
                  time_steps,
                  actions,
                  next_time_steps,
-                 weights=None):
+                 weights=None,
+                 encoder_type=None,
+                 long_obs=None):
     """Computes the actor_loss for SAC training.
 
     Args:
@@ -136,7 +156,9 @@ class RpAgent(sac_agent.SacAgent):
     Returns:
       actor_loss: A scalar actor loss.
     """
+    print("starting actor loss")
     prev_time_steps, prev_actions, time_steps = time_steps, actions, next_time_steps  # pylint: disable=line-too-long
+    print("in function",actions.shape)
     with tf.name_scope('actor_loss'):
       nest_utils.assert_same_structure(time_steps, self.time_step_spec)
 
@@ -152,8 +174,11 @@ class RpAgent(sac_agent.SacAgent):
       ### Flatten time dimension. We'll add it back when adding the loss.
       num_outer_dims = nest_utils.get_outer_rank(time_steps,
                                                  self.time_step_spec)
+      
       has_time_dim = (num_outer_dims == 2)
+
       if has_time_dim:
+        print("here")
         batch_squash = utils.BatchSquash(2)  # Squash B, and T dims.
         obs = batch_squash.flatten(time_steps.observation)
         prev_obs = batch_squash.flatten(prev_time_steps.observation)
@@ -161,14 +186,25 @@ class RpAgent(sac_agent.SacAgent):
       else:
         obs = time_steps.observation
         prev_obs = prev_time_steps.observation
-      z = self._actor_network._z_encoder(obs, training=True)  # pylint: disable=protected-access
+        
+      print("input_obs",obs.shape)
+      print("actions_shape",prev_actions.shape)
+      z,_ = self._actor_network._z_encoder(obs, training=True)  # pylint: disable=protected-access
+      print("got z value")
       prior = self._actor_network._predictor((prev_obs, prev_actions),  # pylint: disable=protected-access
                                              training=True)
 
       # kl is a vector of length batch_size, which has already been summed over
       # the latent dimension z.
       kl = tfp.distributions.kl_divergence(z, prior)
-      if has_time_dim:
+
+      if encoder_type == "long":
+        print(long_obs.shape)
+        _,h = self._actor_network._z_encoder(long_obs, training=True)
+        h_prior = self._actor_network._long_predictor(long_obs,training=True)
+        kl += tfp.distributions.kl_divergence(h, h_prior)
+
+      if has_time_dim and encoder_type != "long":
         kl = batch_squash.unflatten(kl)
 
       kl_coef = tf.stop_gradient(
@@ -192,5 +228,5 @@ class RpAgent(sac_agent.SacAgent):
           name='encoder_kl',
           data=tf.reduce_mean(kl),
           step=self.train_step_counter)
-
+      print("got actor loss")
       return actor_loss

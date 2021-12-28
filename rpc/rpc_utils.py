@@ -47,12 +47,19 @@ class ActorNet(actor_distribution_network.ActorDistributionNetwork):
                fc_layers,
                encoder,
                predictor,
-               initial_log_kl=np.log(1e-6)):
+               initial_log_kl=np.log(1e-6),
+               long_predictor = None):
     self._s_spec = input_tensor_spec
-    self._latent_dim = encoder.layers[-1]._event_shape
+
+    if long_predictor:
+      self._latent_dim = encoder.layers[-1]._event_shape + encoder.layers[-2]._event_shape
+    else:
+      self._latent_dim = encoder.layers[-1]._event_shape
+
     self._z_spec = tensor_spec.TensorSpec(
-        shape=(self._latent_dim,),
-        dtype=tf.float32)
+          shape=(self._latent_dim,),
+          dtype=tf.float32)
+
     super(ActorNet, self).__init__(
         input_tensor_spec=self._z_spec,
         output_tensor_spec=output_tensor_spec,
@@ -61,18 +68,27 @@ class ActorNet(actor_distribution_network.ActorDistributionNetwork):
     self._input_tensor_spec = input_tensor_spec
     self._z_encoder = encoder
     self._predictor = predictor
+    self._long_predictor = long_predictor
     self._log_kl_coefficient = tf.Variable(initial_log_kl, dtype=tf.float32)
 
   @property
   def trainable_variables(self):
     extra_vars = [self._log_kl_coefficient]
     # The parent class already includes the encoder variables.
-    return (super(ActorNet, self).trainable_variables + extra_vars
+    if self._long_predictor == None:
+      return (super(ActorNet, self).trainable_variables + extra_vars
             + self._predictor.trainable_variables)
+    else:
+      return (super(ActorNet, self).trainable_variables + extra_vars
+            + self._predictor.trainable_variables + self._long_predictor.trainable_variables)
 
   def call(self, observations, step_type=(), network_state=(), training=False):
-    z = self._z_encoder(observations, training=training)
-    z = z.sample()
+    if self._long_predictor:
+      l,h = self._z_encoder(observations, training=training)
+      z = tf.concat([l.sample(),h.sample()],axis=1)
+    else:
+      z = self._z_encoder(observations, training=training)
+      z = z.sample()
     self._input_tensor_spec = self._z_spec
     output = super(ActorNet, self).call(
         z, step_type=step_type, network_state=network_state, training=training)
@@ -187,7 +203,8 @@ class AverageKLMetric(tf_metric.TFMultiMetricStepMetric):
                prefix='Metrics',
                dtype=tf.float32,
                batch_size=1,
-               buffer_size=1000):
+               buffer_size=1000,
+               encoder_type="short"):
     super(AverageKLMetric, self).__init__(name=name, prefix=prefix,
                                           metric_names=('KL', 'MSE'))
     self._kl_buffer = tf_metrics.TFDeque(buffer_size, dtype)
@@ -195,13 +212,17 @@ class AverageKLMetric(tf_metric.TFMultiMetricStepMetric):
     self._dtype = dtype
     self._encoder = encoder
     self._predictor = predictor
+    self._encoder_type = encoder_type
 
   @common.function(autograph=True)
   def call(self, inputs):
     time_step, policy_step, next_time_step = inputs
     action = policy_step.action
     prior = self._predictor((time_step.observation, action), training=False)
-    z_next = self._encoder(next_time_step.observation, training=False)
+    if self._encoder_type == "long":
+      z_next,_ = self._encoder(next_time_step.observation, training=False)
+    else:
+      z_next = self._encoder(next_time_step.observation, training=False)
     # Note that kl is a vector of size batch_size.
     kl = tfp.distributions.kl_divergence(z_next, prior)
 
@@ -332,3 +353,4 @@ def eval_helper_fn(tf_env, actor_net, prob_dropout, cutoff=10,
   tf.compat.v2.summary.scalar(
       name='%s_cutoff_x' % prefix, data=avg_cutoff_x, step=global_step)
   return avg_r, avg_t, avg_x, avg_cutoff_r, avg_cutoff_x
+
