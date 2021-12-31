@@ -114,7 +114,7 @@ def train_eval(
     use_residual_predictor=True,
     gym_kwargs=None,
     predict_prior_std=True,
-    random_seed=0,):
+    random_seed=42,):
   """A simple train and eval for SAC."""
 
 
@@ -502,7 +502,6 @@ def train_eval(
     dataset = dataset.batch(batch_size).prefetch(5)
     # Dataset generates trajectories with shape [Bx2x...]
     iterator = iter(dataset)
-
     @tf.function
     def train_step():
       experience, _ = next(iterator)
@@ -516,13 +515,14 @@ def train_eval(
       else:
         z_next = encoder_net(experience.observation[:, 1], training=False)
       predictor_kl = tfp.distributions.kl_divergence(z_next, prior)
-
+      z_kl = predictor_kl
       random_sample = 0
       if encoder_type == "long":
         random_sample = tf.random.uniform(shape=(), minval=1, maxval=long_predictor_steps+1, dtype=tf.int32)
         _,h_next = encoder_net(experience.observation[:, random_sample], training=False)
         h_prior = h_predictor_net(experience.observation[:, 0],training=False)
-        predictor_kl += tfp.distributions.kl_divergence(h_next, h_prior)
+        h_kl = tfp.distributions.kl_divergence(h_next, h_prior)
+        predictor_kl += h_kl
 
       with tf.GradientTape() as tape:
         tape.watch(actor_net._log_kl_coefficient)  # pylint: disable=protected-access
@@ -546,19 +546,43 @@ def train_eval(
                                     step=global_step)
 
       z_entropy = z_next.entropy()
+      z_mse = tf.keras.losses.MSE(z_next.mean(), prior.mean())
       log_prob = prior.log_prob(z_next.sample())
       with tf.name_scope('rp-metrics'):
         common.generate_tensor_summaries('predictor_kl', predictor_kl,
                                          global_step)
+        common.generate_tensor_summaries('z_predictor_kl', z_kl,
+                                         global_step)
+        common.generate_tensor_summaries('z_mse', z_mse,
+                                         global_step)
         common.generate_tensor_summaries('z_entropy', z_entropy, global_step)
-        common.generate_tensor_summaries('log_prob', log_prob, global_step)
+        common.generate_tensor_summaries('z_log_prob', log_prob, global_step)
         common.generate_tensor_summaries('z_mean', z_next.mean(), global_step)
         common.generate_tensor_summaries('z_stddev', z_next.stddev(),
                                          global_step)
-        common.generate_tensor_summaries('prior_mean', prior.mean(),
+        common.generate_tensor_summaries('z_prior_mean', prior.mean(),
                                          global_step)
-        common.generate_tensor_summaries('prior_stddev', prior.stddev(),
+        common.generate_tensor_summaries('z_prior_stddev', prior.stddev(),
                                          global_step)
+        if encoder_type == "long":
+          h_entropy = h_next.entropy()
+          h_log_prob = h_prior.log_prob(h_next.sample())
+          h_mse = tf.keras.losses.MSE(h_next.mean(), h_prior.mean())
+          common.generate_tensor_summaries('h_predictor_kl', h_kl,
+                                         global_step)
+          common.generate_tensor_summaries('h_mse', h_mse,
+                                         global_step)
+          common.generate_tensor_summaries('h_entropy', h_entropy, global_step)
+          common.generate_tensor_summaries('h_log_prob', h_log_prob, global_step)
+          common.generate_tensor_summaries('h_mean', h_next.mean(), global_step)
+          common.generate_tensor_summaries('h_stddev', h_next.stddev(),
+                                         global_step)
+          common.generate_tensor_summaries('h_prior_mean', h_prior.mean(),
+                                         global_step)
+          common.generate_tensor_summaries('h_prior_stddev', h_prior.stddev(),
+                                         global_step)
+          
+                                  
 
       if log_prob_reward_scale == 'auto':
         coef = tf.stop_gradient(tf.exp(actor_net._log_kl_coefficient))  # pylint: disable=protected-access

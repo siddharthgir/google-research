@@ -206,7 +206,7 @@ class AverageKLMetric(tf_metric.TFMultiMetricStepMetric):
                buffer_size=1000,
                encoder_type="short"):
     super(AverageKLMetric, self).__init__(name=name, prefix=prefix,
-                                          metric_names=('KL', 'MSE'))
+                                          metric_names=('z-KL', 'z-MSE'))
     self._kl_buffer = tf_metrics.TFDeque(buffer_size, dtype)
     self._mse_buffer = tf_metrics.TFDeque(buffer_size, dtype)
     self._dtype = dtype
