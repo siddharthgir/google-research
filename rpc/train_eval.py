@@ -107,14 +107,14 @@ def train_eval(
     clip_mean=30.0,
     predictor_num_layers=2,
     long_predictor_steps=3,
-    encoder_type = "long",
+    encoder_type = "short",
     identity_encoder_single_stddev=False,
     kl_constraint=1.0,
     eval_dropout=(),
     use_residual_predictor=True,
     gym_kwargs=None,
     predict_prior_std=True,
-    random_seed=42,):
+    random_seed=700,):
   """A simple train and eval for SAC."""
 
 
@@ -679,7 +679,8 @@ def train_eval(
 
 
 def main(_):
-  os.environ['TF_GPU_THREAD_MODE'] = 'gpu_private'
+  os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+  tf.config.set_visible_devices([], 'GPU')
 
   tf.compat.v1.enable_v2_behavior()
   logging.set_verbosity(logging.INFO)

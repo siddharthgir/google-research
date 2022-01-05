@@ -189,7 +189,10 @@ class RpAgent(sac_agent.SacAgent):
         
       print("input_obs",obs.shape)
       print("actions_shape",prev_actions.shape)
-      z,_ = self._actor_network._z_encoder(obs, training=True)  # pylint: disable=protected-access
+      if encoder_type == "long":
+        z,_ = self._actor_network._z_encoder(obs, training=True)  # pylint: disable=protected-access
+      else:
+        z = self._actor_network._z_encoder(obs, training=True)
       print("got z value")
       prior = self._actor_network._predictor((prev_obs, prev_actions),  # pylint: disable=protected-access
                                              training=True)
