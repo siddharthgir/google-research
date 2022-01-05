@@ -44,6 +44,8 @@ from tf_agents.policies import greedy_policy
 from tf_agents.policies import random_tf_policy
 from tf_agents.replay_buffers import tf_uniform_replay_buffer
 from tf_agents.utils import common
+from tf_agents.networks import utils
+
 
 flags.DEFINE_string('root_dir', os.getenv('TEST_UNDECLARED_OUTPUTS_DIR'),
                     'Root directory for writing logs/summaries/checkpoints.')
@@ -107,7 +109,7 @@ def train_eval(
     clip_mean=30.0,
     predictor_num_layers=2,
     long_predictor_steps=3,
-    encoder_type = "short",
+    encoder_type = "long",
     identity_encoder_single_stddev=False,
     kl_constraint=1.0,
     eval_dropout=(),
@@ -518,8 +520,13 @@ def train_eval(
       z_kl = predictor_kl
       random_sample = 0
       if encoder_type == "long":
-        random_sample = tf.random.uniform(shape=(), minval=1, maxval=long_predictor_steps+1, dtype=tf.int32)
-        _,h_next = encoder_net(experience.observation[:, random_sample], training=False)
+        next_observations = experience.observation[:, 1:random_sample]
+        batch_squash = utils.BatchSquash(2)
+        next_observations_flattened = batch_squash.flatten(next_observations)
+        _,h_next = encoder_net(next_observations_flattened, training=False)
+        h_next = batch_squash.unflatten(h_next)
+        h_next = tf.math.reduce_mean(h_next,axis=2)
+        print(h_next.shape)
         h_prior = h_predictor_net(experience.observation[:, 0],training=False)
         h_kl = tfp.distributions.kl_divergence(h_next, h_prior)
         predictor_kl += h_kl
