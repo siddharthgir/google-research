@@ -26,6 +26,7 @@ import time
 
 from absl import app
 from absl import flags
+import math
 from absl import logging
 import gin
 import numpy as np
@@ -502,8 +503,11 @@ def train_eval(
     dataset = dataset.batch(batch_size).prefetch(5)
     # Dataset generates trajectories with shape [Bx2x...]
     iterator = iter(dataset)
+    base_kl_constraint = 0.1
+    curr_iterations = [1.0]
     @tf.function
     def train_step():
+      curr_iterations[0] += 1.0
       experience, _ = next(iterator)
       print("input to predictor net",experience.observation[:,0].shape)
       print("action input to predictor net",experience.action[:,0].shape)
@@ -524,10 +528,11 @@ def train_eval(
         h_kl = tfp.distributions.kl_divergence(h_next, h_prior)
         predictor_kl += h_kl
 
+      curr_kl_constraint = base_kl_constraint + tf.math.minimum(1.0,tf.cast(global_step/2000000,tf.float32))*(kl_constraint-0.1)
       with tf.GradientTape() as tape:
         tape.watch(actor_net._log_kl_coefficient)  # pylint: disable=protected-access
         dual_loss = -1.0 * actor_net._log_kl_coefficient * (  # pylint: disable=protected-access
-            tf.stop_gradient(tf.reduce_mean(predictor_kl)) - kl_constraint)
+            tf.stop_gradient(tf.reduce_mean(predictor_kl)) - curr_kl_constraint)
       dual_grads = tape.gradient(dual_loss, [actor_net._log_kl_coefficient])  # pylint: disable=protected-access
       grads_and_vars = list(zip(dual_grads, [actor_net._log_kl_coefficient]))  # pylint: disable=protected-access
       dual_optimizer.apply_gradients(grads_and_vars)

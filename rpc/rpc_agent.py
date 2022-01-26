@@ -128,7 +128,7 @@ class RpAgent(sac_agent.SacAgent):
 
     self.train_step_counter.assign_add(1)
     self._update_target()
-
+ 
     total_loss = critic_loss + actor_loss + alpha_loss
 
     extra = sac_agent.SacLossInfo(
