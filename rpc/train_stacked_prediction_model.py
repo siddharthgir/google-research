@@ -23,7 +23,7 @@ import functools
 import json
 import os
 import time
-
+import pdb
 from absl import app
 from absl import flags
 import math
@@ -51,6 +51,8 @@ from tf_agents.networks import utils
 flags.DEFINE_string('trained_agent_dir', os.getenv('TEST_UNDECLARED_OUTPUTS_DIR'),
                     'Directory containing saved policy')
 flags.DEFINE_string('eval_rb_dir', os.getenv('TEST_UNDECLARED_OUTPUTS_DIR'),
+                    'Directory containing saved policy')
+flags.DEFINE_string('train_rb_dir', os.getenv('TEST_UNDECLARED_OUTPUTS_DIR'),
                     'Directory containing saved policy')
 flags.DEFINE_multi_string('gin_file', None, 'Path to the trainer config files.')
 flags.DEFINE_multi_string('gin_bindings', None, 'Gin binding to pass through.')
@@ -87,6 +89,7 @@ def _custom_activation(t,
 
 def get_agent(agent_dir,
   rb_dir,
+  eval_rb_dir,
   env_name='HalfCheetah-v2',
   latent_dim=10,
   predictor_num_layers=2,
@@ -94,7 +97,8 @@ def get_agent(agent_dir,
   critic_obs_fc_layers=None,
   critic_action_fc_layers=None,
   critic_joint_fc_layers=(256, 256),
-  replay_buffer_capacity=100000):
+  replay_buffer_capacity=100000,
+  eval_replay_buffer_capacity = 10000):
 
   env = suite_gym.load(env_name)
   tf_env = tf_py_environment.TFPyEnvironment(env)
@@ -177,7 +181,18 @@ def get_agent(agent_dir,
 
   rb_checkpointer.initialize_or_restore()
 
-  return tf_env,tf_agent,replay_buffer
+  eval_replay_buffer = tf_uniform_replay_buffer.TFUniformReplayBuffer(
+      data_spec=tf_agent.collect_data_spec,
+      batch_size=tf_env.batch_size,
+      max_length=eval_replay_buffer_capacity)
+
+  eval_rb_checkpointer = common.Checkpointer(
+    replay_buffer = eval_replay_buffer,
+    ckpt_dir=eval_rb_dir)
+
+  eval_rb_checkpointer.initialize_or_restore()
+
+  return tf_env,tf_agent,replay_buffer,eval_replay_buffer
 
 
 
@@ -187,6 +202,7 @@ def _filter_invalid_transition(trajectories,unusedarg1):
 @gin.configurable
 def train_prediction_model(
     trained_agent_dir,
+    train_rb_dir,
     eval_rb_dir,
     stacked_steps=5,
     num_epochs=10,
@@ -196,7 +212,7 @@ def train_prediction_model(
     ):
 
     
-    tf_env,tf_agent,rb = get_agent(trained_agent_dir,eval_rb_dir,latent_dim=latent_dim)
+    tf_env,tf_agent,rb,eval_rb = get_agent(trained_agent_dir,train_rb_dir,eval_rb_dir,latent_dim=latent_dim)
 
     action_spec = tf_env.action_spec()
 
@@ -206,13 +222,32 @@ def train_prediction_model(
         learning_rate=learning_rate)
 
     train_loss = tf.keras.metrics.Mean('train_loss', dtype=tf.float32)
-    current_time = "run_5_frame"
+    current_time = "rnn_frames_"+str(stacked_steps)
     train_log_dir = 'logs/gradient_tape/' + current_time + '/train'
     train_summary_writer = tf.summary.create_file_writer(train_log_dir)
 
+    evaluation_loss_1 = tf.keras.metrics.Mean('evaluation_loss_step_1', dtype=tf.float32)
+    evaluation_loss_2 = tf.keras.metrics.Mean('evaluation_loss_step_2', dtype=tf.float32)
+    evaluation_loss_3 = tf.keras.metrics.Mean('evaluation_loss_step_3', dtype=tf.float32)
+    evaluation_loss_4 = tf.keras.metrics.Mean('evaluation_loss_step_4', dtype=tf.float32)
+    evaluation_loss_5 = tf.keras.metrics.Mean('evaluation_loss_step_5', dtype=tf.float32)
 
 
 
+
+    lstm_z_input = tf.keras.layers.Input((stacked_steps,latent_dim),batch_size=128)
+    lstm_a_input = tf.keras.layers.Input((stacked_steps,action_spec.shape[0]),batch_size=128)
+    za = tf.concat([lstm_z_input,lstm_a_input],axis=2)
+    lstm_model = tf.keras.layers.LSTM(32,return_sequences=True,stateful=True)(za)
+    
+    loc_scale = tf.keras.Sequential(
+        2 * [tf.keras.layers.Dense(128, activation='relu')]+[tf.keras.layers.Dense(latent_dim,activation=_custom_activation,kernel_initializer='zeros')])(lstm_model)
+    combined_loc_scale = loc_scale + lstm_z_input[:,-latent_dim:]
+
+    predictor_net = tf.keras.Model(inputs=[lstm_z_input,lstm_a_input],outputs=combined_loc_scale)
+    #model = tf.keras.Sequential()
+
+    """
     #Creation of model
     z_input = tf.keras.layers.Input(latent_dim*stacked_steps)
     a_input = tf.keras.layers.Input(action_spec.shape[0]*stacked_steps)
@@ -222,6 +257,7 @@ def train_prediction_model(
     combined_loc_scale = loc_scale + z_input[:,-latent_dim:]
     predictor_net = tf.keras.Model(inputs=(z_input, a_input),
                                     outputs=combined_loc_scale)
+    """
 
     dataset = rb.as_dataset(sample_batch_size=128,num_steps=stacked_steps+1).filter(_filter_invalid_transition)
 
@@ -231,50 +267,113 @@ def train_prediction_model(
 
     def train(trajectories):
       #Generate Encodings First
-      batch_squash = utils.BatchSquash(1)
-      print(trajectories.observation.shape)
+      batch_squash = utils.BatchSquash(2)
       obs = batch_squash.flatten(trajectories.observation)
-      latent_encodings = encoder(obs,training=False)
+      latent_encodings = encoder(obs,training=False).mean()
       latent_encodings = batch_squash.unflatten(latent_encodings)
-      prev_encodings = latent_encodings[:,:-1]
-      input_trajs = tf.reshape(prev_encodings,[-1,prev_encodings.shape[1]*prev_encodings.shape[2]])
+
+      input_trajs = latent_encodings[:,:-1]
       output_encoding = latent_encodings[:,-1]
       actions = trajectories.action[:,:-1]
-      actions = tf.reshape(actions,[-1,actions.shape[1]*actions.shape[2]])
+
       predicted_encoding = predictor_net((input_trajs,actions),training=True)
-      loss = tf.keras.losses.mean_squared_error(predicted_encoding, output_encoding)
+      loss = tf.keras.losses.mean_squared_error(predicted_encoding[:,-1], output_encoding)
+
+      predictor_net.layers[3].reset_states()
+      pdb.set_trace()
       return loss
+
+    def eval_step(trajectories):
+      batch_squash = utils.BatchSquash(2)
+      obs = batch_squash.flatten(trajectories.observation)
+      latent_encodings = encoder(obs,training=False).mean()
+      latent_encodings = batch_squash.unflatten(latent_encodings)
+      prev_encodings = latent_encodings[:,:stacked_steps]
+      input_trajs = tf.reshape(prev_encodings,[-1,prev_encodings.shape[1]*prev_encodings.shape[2]])
+
+      actions = trajectories.action[:,:stacked_steps]
+      actions = tf.reshape(actions,[-1,actions.shape[1]*actions.shape[2]])
+      
+      predicted_encoding = predictor_net((input_trajs,actions),training=False)
+
+      output_encoding = latent_encodings[:,stacked_steps]
+
+
+      losses = []
+      losses.append(tf.keras.losses.MSE(output_encoding, predicted_encoding))
+      
+      for i in range(1,5):
+        input_trajs = tf.concat([input_trajs,predicted_encoding],axis=1)
+        input_trajs = input_trajs[:,-10:]
+        tf.debugging.assert_equal(input_trajs,predicted_encoding)
+        actions = trajectories.action[:,i:stacked_steps+i]
+        actions = tf.reshape(actions,[-1,actions.shape[1]*actions.shape[2]])
+        predicted_encoding = predictor_net((input_trajs,actions),training=False)
+        output_encoding = latent_encodings[:,stacked_steps+i]
+        losses.append(tf.keras.losses.MSE(output_encoding, predicted_encoding))
+      
+      return losses
+
+
+    def eval(timestep):
+      dataset = eval_rb.as_dataset(sample_batch_size=128,num_steps=stacked_steps+5,single_deterministic_pass=True).filter(_filter_invalid_transition)
+      dataset.prefetch(10)
+      iterator = iter(dataset)
+      eval_step = common.function(eval_step)
+
+      for trajectories,_ in iterator:
+        losses = eval_step(trajectories)
+        evaluation_loss_1(losses[0])
+        evaluation_loss_2(losses[1])
+        evaluation_loss_3(losses[2])
+        evaluation_loss_4(losses[3])
+        evaluation_loss_5(losses[4])
+
+      with train_summary_writer.as_default():
+        tf.summary.scalar('eval_loss_step_1', evaluation_loss_1.result(), step=timestep)
+        tf.summary.scalar('eval_loss_step_2', evaluation_loss_2.result(), step=timestep)
+        tf.summary.scalar('eval_loss_step_3', evaluation_loss_3.result(), step=timestep)
+        tf.summary.scalar('eval_loss_step_4', evaluation_loss_4.result(), step=timestep)
+        tf.summary.scalar('eval_loss_step_5', evaluation_loss_5.result(), step=timestep)
+
+      evaluation_loss_1.reset_states()
+      evaluation_loss_2.reset_states()
+      evaluation_loss_3.reset_states()
+      evaluation_loss_4.reset_states()
+      evaluation_loss_5.reset_states
+                  
+        
     
     train = common.function(train)
 
     i = 0
-    e = 0
-    epoch_cnt = 0
-    for epoch in range(num_epochs):
-      for trajectories,_ in iterator: #Adjust length  
-          with tf.GradientTape() as tape:      
-            loss = train(trajectories)
-          grads = tape.gradient(loss, predictor_net.trainable_weights)
-          optimizer.apply_gradients(zip(grads, predictor_net.trainable_weights))
-          train_loss(loss)
+    for trajectories,_ in iterator: #Adjust length  
+        with tf.GradientTape() as tape:      
+          loss = train(trajectories)
+        grads = tape.gradient(loss, predictor_net.trainable_weights)
+        optimizer.apply_gradients(zip(grads, predictor_net.trainable_weights))
+        train_loss(loss)
+        
+        if i%2000 == 0:
+          with train_summary_writer.as_default():
+              tf.summary.scalar('loss', train_loss.result(), step=i) 
+          print("Epoch",epoch,"Iteration",i,":",train_loss.result())
+          train_loss.reset_states()
+
+        if i%10000 == 0:
+          eval(i)
+          predictor_net.save('curr_model_'+current_time+'/my_model')
+
+        if i%100000 == 0:
+          predictor_net.save('curr_model_'+current_time+'/model_epoch_'+str(i))
           
-          if i%2000 == 0:
-            with train_summary_writer.as_default():
-                tf.summary.scalar('loss', train_loss.result(), step=e*2000) 
-            print("Epoch",epoch,"Iteration",e*2000,":",train_loss.result())
-            train_loss.reset_states()
-            if e%5 == 0:
-              predictor_net.save('curr_model_'+current_time+'/my_model')
-            if e%50 == 0:
-              predictor_net.save('curr_model_'+current_time+'/model_epoch_'+str(epoch_cnt))
-              epoch_cnt += 1
-            i = 0
-            e += 1
-            
-          i += 1
+        if i%2500000 == 0:
+          break
+
+        i += 1
       
     
-      
+  
 
 
    
@@ -295,10 +394,13 @@ def main(_):
 
   trained_agent_dir = FLAGS.trained_agent_dir
   eval_rb_dir = FLAGS.eval_rb_dir
-  train_prediction_model(trained_agent_dir,eval_rb_dir)
+  train_rb_dir = FLAGS.train_rb_dir
+  train_prediction_model(trained_agent_dir,train_rb_dir,eval_rb_dir)
 
 if __name__ == '__main__':
   flags.mark_flag_as_required('trained_agent_dir')
+  flags.mark_flag_as_required('train_rb_dir')
+
   flags.mark_flag_as_required('eval_rb_dir')
   
   app.run(main)
