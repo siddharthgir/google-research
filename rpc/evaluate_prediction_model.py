@@ -220,7 +220,7 @@ def evaluate_prediction_model(
     trained_agent_dir,
     eval_rb_dir,
     trained_predictor_dir=None,
-    stacked_steps=9,
+    stacked_steps=5,
     env_name='HalfCheetah-v2',
     use_default_predictor=False
     ):
@@ -235,7 +235,7 @@ def evaluate_prediction_model(
 
     evaluation_loss = tf.keras.metrics.Mean('evaluation_loss', dtype=tf.float32)
 
-    dataset = rb.as_dataset(sample_batch_size=128,num_steps=stacked_steps+5,single_deterministic_pass=True).filter(_filter_invalid_transition)
+    dataset = rb.as_dataset(sample_batch_size=128,num_steps=stacked_steps+5).filter(_filter_invalid_transition)
     dataset.prefetch(10)
     iterator = iter(dataset)
 
@@ -280,7 +280,7 @@ def evaluate_prediction_model(
       batch_squash = utils.BatchSquash(2)
 
       obs = batch_squash.flatten(trajectories.observation)
-      latent_encodings = encoder(obs,training=False)
+      latent_encodings = encoder(obs,training=False).mean()
       latent_encodings = batch_squash.unflatten(latent_encodings)
       prev_encodings = latent_encodings[:,:stacked_steps]
       input_trajs = tf.reshape(prev_encodings,[-1,prev_encodings.shape[1]*prev_encodings.shape[2]])
@@ -298,7 +298,7 @@ def evaluate_prediction_model(
       
 
       
-      for i in range(1,5):
+      for i in range(1,1):
         input_trajs = tf.concat([input_trajs,predicted_encoding],axis=1)
         input_trajs = input_trajs[:,-10:]
         tf.debugging.assert_equal(input_trajs,predicted_encoding)
@@ -317,17 +317,19 @@ def evaluate_prediction_model(
     for i in range(25):
       np.save("eval_results_frames_"+str(stacked_steps)+".npy",results)
       print("At epoch",i,results)
-      n = 0
-      dataset = rb.as_dataset(sample_batch_size=128,num_steps=stacked_steps+1,single_deterministic_pass=True).filter(_filter_invalid_transition)
+      dataset = rb.as_dataset(sample_batch_size=128,num_steps=stacked_steps+1).filter(_filter_invalid_transition)
       dataset.prefetch(10)
       iterator = iter(dataset)
       evaluate = common.function(evaluate_proto)
       trained_predictor = tf.keras.models.load_model(trained_predictor_dir+"/model_epoch_"+str(i))
 
+      i = 0
       for trajectories,_ in iterator: #Adjust length
+        i += 128  
         losses = evaluate(trajectories,trained_predictor)
-        evaluation_loss(losses[0])          
-        n += 1
+        evaluation_loss(losses[0])    
+        if i > 10000:
+          break  
 
       results.append(evaluation_loss.result())
       evaluation_loss.reset_states()

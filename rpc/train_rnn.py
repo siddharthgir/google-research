@@ -204,7 +204,7 @@ def train_prediction_model(
     trained_agent_dir,
     train_rb_dir,
     eval_rb_dir,
-    stacked_steps=10,
+    stacked_steps=5,
     num_epochs=10,
     env_name='HalfCheetah-v2',
     learning_rate=1e-4,
@@ -222,7 +222,7 @@ def train_prediction_model(
         learning_rate=learning_rate)
 
     train_loss = tf.keras.metrics.Mean('train_loss', dtype=tf.float32)
-    current_time = "frames_stack_multi_"+str(stacked_steps)
+    current_time = "rnn_multi_"+str(stacked_steps)
     train_log_dir = 'logs/gradient_tape/' + current_time + '/train'
     train_summary_writer = tf.summary.create_file_writer(train_log_dir)
 
@@ -235,7 +235,19 @@ def train_prediction_model(
 
 
 
+    lstm_z_input = tf.keras.layers.Input((1,latent_dim),batch_size=128)
+    lstm_a_input = tf.keras.layers.Input((1,action_spec.shape[0]),batch_size=128)
+    za = tf.concat([lstm_z_input,lstm_a_input],axis=2)
+    lstm_model = tf.keras.layers.LSTM(32,return_sequences=True,stateful=True)(za)
+    
+    loc_scale = tf.keras.Sequential(
+        2 * [tf.keras.layers.Dense(256, activation='relu')]+[tf.keras.layers.Dense(latent_dim,activation=_custom_activation,kernel_initializer='zeros')])(lstm_model)
+    combined_loc_scale = loc_scale + lstm_z_input[:,-latent_dim:]
 
+    predictor_net = tf.keras.Model(inputs=[lstm_z_input,lstm_a_input],outputs=combined_loc_scale)
+    #model = tf.keras.Sequential()
+
+    """
     #Creation of model
     z_input = tf.keras.layers.Input(latent_dim*stacked_steps)
     a_input = tf.keras.layers.Input(action_spec.shape[0]*stacked_steps)
@@ -245,11 +257,9 @@ def train_prediction_model(
     combined_loc_scale = loc_scale + z_input[:,-latent_dim:]
     predictor_net = tf.keras.Model(inputs=(z_input, a_input),
                                     outputs=combined_loc_scale)
+    """
 
-    if stacked_steps%2 == 0:
-      dataset = rb.as_dataset(sample_batch_size=128,num_steps=stacked_steps+2).filter(_filter_invalid_transition)
-    else:
-      dataset = rb.as_dataset(sample_batch_size=128,num_steps=stacked_steps+1).filter(_filter_invalid_transition)
+    dataset = rb.as_dataset(sample_batch_size=128,num_steps=stacked_steps+1).filter(_filter_invalid_transition)
 
     dataset = dataset.prefetch(10)
 
@@ -257,60 +267,62 @@ def train_prediction_model(
 
     def train(trajectories):
       #Generate Encodings First
+      predictor_net.layers[3].reset_states()
+
       batch_squash = utils.BatchSquash(2)
       obs = batch_squash.flatten(trajectories.observation)
       latent_encodings = encoder(obs,training=False).mean()
       latent_encodings = batch_squash.unflatten(latent_encodings)
 
-      prev_encodings = latent_encodings[:,:stacked_steps]
-      input_trajs = tf.reshape(prev_encodings,[-1,prev_encodings.shape[1]*prev_encodings.shape[2]])
+
+      for i in range(0,stacked_steps):
+        input_traj = tf.expand_dims(latent_encodings[:,i],axis=1)
+        action = tf.expand_dims(trajectories.action[:,i],axis=1)
+        predicted_encoding = predictor_net((input_traj,action),training=True)
+
+
       output_encoding = latent_encodings[:,stacked_steps]
+      loss = tf.keras.losses.mean_squared_error(predicted_encoding[:,0], output_encoding)
 
-      actions = trajectories.action[:,:stacked_steps]
-      actions = tf.reshape(actions,[-1,actions.shape[1]*actions.shape[2]])
-
-      predicted_encoding = predictor_net((input_trajs,actions),training=True)
-      loss = tf.keras.losses.mean_squared_error(predicted_encoding, output_encoding)
-
+      predictor_net.layers[3].reset_states()
       return loss
 
     def eval_step(trajectories):
+      predictor_net.layers[3].reset_states()
+
       batch_squash = utils.BatchSquash(2)
       obs = batch_squash.flatten(trajectories.observation)
       latent_encodings = encoder(obs,training=False).mean()
       latent_encodings = batch_squash.unflatten(latent_encodings)
-      prev_encodings = latent_encodings[:,:stacked_steps]
-      input_trajs = tf.reshape(prev_encodings,[-1,prev_encodings.shape[1]*prev_encodings.shape[2]])
 
-      actions = trajectories.action[:,:stacked_steps]
-      actions = tf.reshape(actions,[-1,actions.shape[1]*actions.shape[2]])
-      
-      predicted_encoding = predictor_net((input_trajs,actions),training=False)
+      for i in range(0,stacked_steps):
+        input_traj = tf.expand_dims(latent_encodings[:,i],axis=1)
+        action = tf.expand_dims(trajectories.action[:,i],axis=1)
+        predicted_encoding = predictor_net((input_traj,action),training=True)
 
       output_encoding = latent_encodings[:,stacked_steps]
 
 
       losses = []
-      losses.append(tf.keras.losses.MSE(output_encoding, predicted_encoding))
+      losses.append(tf.keras.losses.MSE(output_encoding, predicted_encoding[:,0]))
       
-      for i in range(1,5):
-        input_trajs = tf.concat([input_trajs,predicted_encoding],axis=1)
-        input_trajs = input_trajs[:,10:]
-        actions = trajectories.action[:,i:stacked_steps+i]
-        actions = tf.reshape(actions,[-1,actions.shape[1]*actions.shape[2]])
+      for i in range(0,4):
+        input_trajs = predicted_encoding
+        actions = tf.expand_dims(trajectories.action[:,stacked_steps+i],axis=1)
         predicted_encoding = predictor_net((input_trajs,actions),training=False)
-        output_encoding = latent_encodings[:,stacked_steps+i]
-        losses.append(tf.keras.losses.MSE(output_encoding, predicted_encoding))
+        output_encoding = latent_encodings[:,stacked_steps+i+1]
+        losses.append(tf.keras.losses.MSE(output_encoding, predicted_encoding[:,0]))
       
+      predictor_net.layers[3].reset_states()
       return losses
 
     eval_step = common.function(eval_step)
 
-
     def eval(timestep):
-      eval_dataset = eval_rb.as_dataset(sample_batch_size=128,num_steps=stacked_steps+5).filter(_filter_invalid_transition)
-      eval_dataset.prefetch(10)
-      iterator = iter(eval_dataset)
+      dataset = eval_rb.as_dataset(sample_batch_size=128,num_steps=stacked_steps+5).filter(_filter_invalid_transition)
+      dataset.prefetch(10)
+      iterator = iter(dataset)
+
       i = 0
       for trajectories,_ in iterator:
         losses = eval_step(trajectories)
@@ -334,7 +346,7 @@ def train_prediction_model(
       evaluation_loss_2.reset_states()
       evaluation_loss_3.reset_states()
       evaluation_loss_4.reset_states()
-      evaluation_loss_5.reset_states
+      evaluation_loss_5.reset_states()
                   
         
     
