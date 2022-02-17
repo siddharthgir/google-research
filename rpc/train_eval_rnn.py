@@ -111,10 +111,10 @@ def train_eval(
     use_identity_encoder=False,
     identity_encoder_single_stddev=False,
     kl_constraint=1.0,
-    eval_dropout=(),
+    eval_dropout=(0.5,0.8,0.9,0.99,1.0),
     use_residual_predictor=True,
     gym_kwargs=None,
-    predict_prior_std=Trued,
+    predict_prior_std=True,
     random_seed=0,):
   """A simple train and eval for SAC."""
   np.random.seed(random_seed)
