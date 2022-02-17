@@ -204,7 +204,7 @@ def train_prediction_model(
     trained_agent_dir,
     train_rb_dir,
     eval_rb_dir,
-    stacked_steps=10,
+    stacked_steps=1,
     num_epochs=10,
     env_name='HalfCheetah-v2',
     learning_rate=1e-4,
