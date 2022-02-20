@@ -30,7 +30,7 @@ from absl import logging
 import gin
 import numpy as np
 import rpc_agent_rnn
-import rpc_utils
+import rpc_utils_rnn
 from six.moves import range
 import tensorflow as tf
 import tensorflow_probability as tfp
@@ -45,7 +45,6 @@ from tf_agents.policies import random_tf_policy
 from tf_agents.replay_buffers import tf_uniform_replay_buffer
 from tf_agents.utils import common
 from tf_agents.networks import utils
-
 
 flags.DEFINE_string('root_dir', os.getenv('TEST_UNDECLARED_OUTPUTS_DIR'),
                     'Root directory for writing logs/summaries/checkpoints.')
@@ -111,7 +110,7 @@ def train_eval(
     use_identity_encoder=False,
     identity_encoder_single_stddev=False,
     kl_constraint=1.0,
-    eval_dropout=(0.5,0.8,0.9,0.99,1.0),
+    eval_dropout=[1.0],
     use_residual_predictor=True,
     gym_kwargs=None,
     predict_prior_std=True,
@@ -159,7 +158,7 @@ def train_eval(
       t1, t2 = tf.split(t, 2, axis=1)
       low = -np.inf if clip_mean is None else -clip_mean
       high = np.inf if clip_mean is None else clip_mean
-      t1 = rpc_utils.squash_to_range(t1, low, high)
+      t1 = rpc_utils_rnn.squash_to_range(t1, low, high)
 
       if clip_min_stddev is None:
         low = -np.inf
@@ -169,7 +168,7 @@ def train_eval(
         high = np.inf
       else:
         high = tf.math.log(tf.exp(clip_max_stddev) - 1.0)
-      t2 = rpc_utils.squash_to_range(t2, low, high)
+      t2 = rpc_utils_rnn.squash_to_range(t2, low, high)
       return tf.concat([t1, t2], axis=1)
 
     if use_identity_encoder:
@@ -276,20 +275,22 @@ def train_eval(
     z = tf.reshape(z,(batch_size,10,latent_dim))
     print(z.shape)
     za = tf.concat([z,action_input],axis=2)
-    lstm_model = tf.keras.layers.LSTM(64,stateful=False,return_sequences=False)(za)
+    za_input = tf.keras.layers.Input((za.shape[1],za.shape[2]))
+    lstm_model = tf.keras.layers.LSTM(64,stateful=False,return_sequences=False)(za_input)
     loc_scale = tf.keras.Sequential(
         2 * [tf.keras.layers.Dense(256, activation='relu')]+[tf.keras.layers.Dense(tfp.layers.IndependentNormal.params_size(latent_dim),activation=_activation,kernel_initializer='zeros')])(lstm_model)
     combined_loc_scale = tf.concat([
-        loc_scale[:, :latent_dim] + za[:, -1,:latent_dim],
+        loc_scale[:, :latent_dim] + za_input[:, -1,:latent_dim],
         loc_scale[:, latent_dim:]],axis=1)
 
     dist = tfp.layers.IndependentNormal(latent_dim)(combined_loc_scale)
-    predictor_net = tf.keras.Model(inputs=[obs_input,action_input],outputs=dist)
+    output = tf.keras.Model(inputs=za_input, outputs=dist)(za)
+    predictor_net = tf.keras.Model(inputs=[obs_input,action_input],outputs=output)
 
     if use_recurrent_actor:
-      ActorClass = rpc_utils.RecurrentActorNet  # pylint: disable=invalid-name
+      ActorClass = rpc_utils_rnn.RecurrentActorNet  # pylint: disable=invalid-name
     else:
-      ActorClass = rpc_utils.ActorNet  # pylint: disable=invalid-name
+      ActorClass = rpc_utils_rnn.ActorNet  # pylint: disable=invalid-name
     actor_net = ActorClass(
         input_tensor_spec=observation_spec,
         output_tensor_spec=action_spec,
@@ -297,7 +298,7 @@ def train_eval(
         predictor=predictor_net,
         fc_layers=actor_fc_layers)
 
-    critic_net = rpc_utils.CriticNet(
+    critic_net = rpc_utils_rnn.CriticNet(
         (observation_spec, action_spec),
         observation_fc_layer_params=critic_obs_fc_layers,
         action_fc_layer_params=critic_action_fc_layers,
@@ -350,7 +351,7 @@ def train_eval(
         tf_metrics.AverageEpisodeLengthMetric(
             buffer_size=num_eval_episodes, batch_size=tf_env.batch_size),
     ]
-    kl_metric = rpc_utils.AverageKLMetric(
+    kl_metric = rpc_utils_rnn.AverageKLMetric(
         encoder=encoder_net,
         predictor=predictor_net,
         batch_size=tf_env.batch_size)
@@ -519,6 +520,8 @@ def train_eval(
       print(gin.operative_config_str())
 
     global_step_val = global_step.numpy()
+    enter_once = True
+
     while global_step_val < num_iterations:
       start_time = time.time()
       time_step, policy_state = collect_driver.run(
@@ -560,6 +563,17 @@ def train_eval(
         train_metric.tf_summaries(
             train_step=global_step, step_metrics=train_metrics[:2])
 
+      if global_step_val%1000000 == 0 or enter_once:
+        enter_once = False
+        for prob_dropout in eval_dropout:
+          avg_r, avg_t, avg_x, avg_cutoff_r, avg_cutoff_x = rpc_utils_rnn.eval_dropout_fn(eval_tf_env, actor_net, global_step, prob_dropout=prob_dropout)
+          with tf.compat.v2.summary.record_if(True):
+            common.generate_tensor_summaries('%f_reward' % prob_dropout, avg_r, global_step)
+            common.generate_tensor_summaries('%f_duration' % prob_dropout, avg_t, global_step)
+            common.generate_tensor_summaries('%f_final_x' % prob_dropout, avg_x, global_step)
+            common.generate_tensor_summaries('%f_cutoff_return' % prob_dropout, avg_cutoff_r, global_step)
+            common.generate_tensor_summaries('%f_cutoff_x' % prob_dropout, avg_cutoff_x, global_step)
+
       if global_step_val % eval_interval == 0:
         start_time = time.time()
         for name, eval_tf_env, eval_metrics in eval_vec:
@@ -576,9 +590,6 @@ def train_eval(
             eval_metrics_callback(results, global_step_val)
           metric_utils.log_metrics(eval_metrics, prefix=name)
         logging.info('Evaluation: %d min', (time.time() - start_time) / 60)
-        for prob_dropout in eval_dropout:
-          rpc_utils.eval_dropout_fn(
-              eval_tf_env, actor_net, global_step, prob_dropout=prob_dropout)
 
       if global_step_val % train_checkpoint_interval == 0:
         train_checkpointer.save(global_step=global_step_val)
